@@ -5,10 +5,9 @@
 ## 1) 环境
 
 ```bash
-export PATH="$HOME/miniforge3/bin:$PATH"
-eval "$(conda shell.bash hook)"
-conda activate alphazero
-cd /home/fm/alphazero9
+conda create -n alphazero-go python=3.10 -y
+conda activate alphazero-go
+pip install -r requirements.txt
 ```
 
 ## 2) 最小冒烟（覆盖新优化）

@@ -1,6 +1,6 @@
 # AlphaZero9 重构执行手册（性能 + 棋力）
 
-> 适用项目：`/home/fm/alphazero9`  
+> 适用项目：本仓库根目录  
 > 文档目标：你打开后可以直接照着改、照着跑、照着验收。  
 > 阅读顺序：`1.一页速览 -> 2.直接可用命令 -> 3.逐项改造说明 -> 4.A/B验收模板`
 
@@ -37,10 +37,9 @@
 ## 2.1 环境
 
 ```bash
-export PATH="$HOME/miniforge3/bin:$PATH"
-eval "$(conda shell.bash hook)"
-conda activate alphazero
-cd /home/fm/alphazero9
+conda create -n alphazero-go python=3.10 -y
+conda activate alphazero-go
+pip install -r requirements.txt
 ```
 
 ## 2.2 最小冒烟（覆盖 1/3/4/6）

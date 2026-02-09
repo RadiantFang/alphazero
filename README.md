@@ -17,10 +17,9 @@
 ### 1.1 环境准备
 
 ```bash
-export PATH="$HOME/miniforge3/bin:$PATH"
-eval "$(conda shell.bash hook)"
-conda activate alphazero
-cd /home/fm/alphazero9
+conda create -n alphazero-go python=3.10 -y
+conda activate alphazero-go
+pip install -r requirements.txt
 ```
 
 ### 1.2 快速功能验证（2 轮，约几十秒）
