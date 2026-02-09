@@ -18,8 +18,9 @@
 
 ```bash
 export PATH="$HOME/miniforge3/bin:$PATH"
-conda activate alphazero9
-cd /mnt/data/alphazero9
+eval "$(conda shell.bash hook)"
+conda activate alphazero
+cd /home/fm/alphazero9
 ```
 
 ### 1.2 快速功能验证（2 轮，约几十秒）
