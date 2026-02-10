@@ -154,7 +154,8 @@ class BoardWidget(QWidget):
                     marker = QColor("#d33f2a") if v == BLACK else QColor("#2a2a2a")
                     p.setBrush(marker)
                     p.setPen(QPen(marker, 1))
-                    p.drawEllipse(QPointF(cx, cy), 4, 4)
+                    marker_radius = max(6, int(self.cell * 0.14))
+                    p.drawEllipse(QPointF(cx, cy), marker_radius, marker_radius)
 
 
 class BattleWindow(QMainWindow):
@@ -426,10 +427,19 @@ class BattleWindow(QMainWindow):
         if not self.state.is_legal(move):
             QMessageBox.warning(self, "非法落子", f"该落子不合法: {move}")
             return
+        prev_state = self.state
         by = "黑方" if self.state.to_play == BLACK else "白方"
         label = "pass" if move is None else f"{move[0]},{move[1]}"
-        self.logs.append(f"{by}: {label}")
         self.state = self.state.play(move)
+        if prev_state.to_play == BLACK:
+            captured = self.state.black_captures - prev_state.black_captures
+        else:
+            captured = self.state.white_captures - prev_state.white_captures
+        captured_n = max(0, int(captured))
+        if captured_n > 0:
+            self.logs.append(f"{by}: {label} | 提子 {captured_n} 子")
+        else:
+            self.logs.append(f"{by}: {label}")
         self.history.append(self.state)
         self._refresh_view()
         self._maybe_auto_step()
