@@ -525,12 +525,17 @@ class BattleWindow(QMainWindow):
             return
         QTimer.singleShot(10, self.ai_step)
 
+    def _update_log_view(self):
+        self.log_view.setPlainText("\n".join(self.logs[-200:]))
+        sb = self.log_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def _refresh_view(self):
         if (not self.game_started) or self.state is None:
             self.turn_label.setText("当前行棋: 未开始")
             self.score_label.setText("比分: -")
             self.terminal_label.setText("请点击“开始对局”")
-            self.log_view.setPlainText("\n".join(self.logs[-200:]))
+            self._update_log_view()
             self.undo_btn.setEnabled(False)
             self.pass_btn.setEnabled(False)
             return
@@ -560,7 +565,7 @@ class BattleWindow(QMainWindow):
                 self.terminal_label.setText("终局: 和棋")
         else:
             self.terminal_label.setText("")
-        self.log_view.setPlainText("\n".join(self.logs[-200:]))
+        self._update_log_view()
         self.undo_btn.setEnabled(len(self.history) > 1)
         self.pass_btn.setEnabled((not self._game_over()) and self._human_turn())
 
