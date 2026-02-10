@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import glob
+import os
 import re
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -169,9 +171,18 @@ class BattleWindow(QMainWindow):
         self.history: list[GoState] = []
         self.logs: list[str] = []
         self.model_cache: dict[tuple[str, str], ModelBundle] = {}
+        self.mcts_cache: dict[tuple[str, str, int, int], MCTS] = {}
         self.auto_playing = False
         self.manual_game_end = False
         self.game_started = False
+        self.infer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ui_mcts")
+        self.pending_infer_future: Future | None = None
+        self.pending_infer_snapshot: tuple[int, int, bytes] | None = None
+        self.pending_infer_token = 0
+        self.log_timer = QTimer(self)
+        self.log_timer.setSingleShot(True)
+        self.log_timer.timeout.connect(self._flush_log_view)
+        self._log_dirty = False
 
         self.board = BoardWidget()
         self.board.on_click = self.on_board_click
@@ -214,6 +225,7 @@ class BattleWindow(QMainWindow):
 
         self._build_ui()
         self._apply_font_theme()
+        self._configure_runtime_threads()
         self._bind_events()
         self.refresh_checkpoints()
         self._refresh_view()
@@ -292,7 +304,28 @@ class BattleWindow(QMainWindow):
         self.black_role.currentIndexChanged.connect(self._on_option_changed)
         self.white_role.currentIndexChanged.connect(self._on_option_changed)
 
+    def _configure_runtime_threads(self):
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        torch_threads = max(1, min(4, cpu_count // 2))
+        torch.set_num_threads(torch_threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            # PyTorch may reject resetting interop threads after initialization.
+            pass
+
+    def _cancel_pending_inference(self):
+        self.pending_infer_token += 1
+        if self.pending_infer_future is not None:
+            self.pending_infer_future.cancel()
+            self.pending_infer_future = None
+            self.pending_infer_snapshot = None
+        self._set_ai_status("")
+
     def refresh_checkpoints(self):
+        self._cancel_pending_inference()
+        self.model_cache.clear()
+        self.mcts_cache.clear()
         options = [("真人", ROLE_HUMAN)]
         for p in sorted(glob.glob("checkpoints/**/*.pt", recursive=True)):
             if Path(p).name.startswith("_runtime_best_"):
@@ -355,6 +388,7 @@ class BattleWindow(QMainWindow):
         return 8
 
     def new_game(self):
+        self._cancel_pending_inference()
         self.auto_playing = False
         self.manual_game_end = False
         self.game_started = True
@@ -433,6 +467,7 @@ class BattleWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", str(e))
 
     def import_sgf(self):
+        self._cancel_pending_inference()
         path, _ = QFileDialog.getOpenFileName(
             self,
             "导入 SGF",
@@ -505,6 +540,7 @@ class BattleWindow(QMainWindow):
     def end_game(self):
         if not self.game_started or self.state is None:
             return
+        self._cancel_pending_inference()
         self.auto_playing = False
         self.auto_btn.setText("自动到终局")
         if not self.manual_game_end and not self.state.is_terminal():
@@ -528,6 +564,7 @@ class BattleWindow(QMainWindow):
     def undo_move(self):
         if (not self.game_started) or len(self.history) <= 1:
             return
+        self._cancel_pending_inference()
         self.auto_playing = False
         self.manual_game_end = False
         self.auto_btn.setText("自动到终局")
@@ -586,10 +623,10 @@ class BattleWindow(QMainWindow):
         if trigger_auto:
             self._maybe_auto_step()
 
-    def _set_ai_status(self, text: str):
+    def _set_ai_status(self, text: str, flush: bool = False):
         self.ai_status_label.setText(text)
-        # Force repaint before heavy MCTS inference so users can see the hint immediately.
-        QApplication.processEvents()
+        if flush:
+            QApplication.processEvents()
 
     def _build_bundle(self, ckpt_path: str, device: str) -> ModelBundle:
         key = (ckpt_path, device)
@@ -613,14 +650,67 @@ class BattleWindow(QMainWindow):
         self.model_cache[key] = bundle
         return bundle
 
+    def _build_mcts(self, role: str, bundle: ModelBundle, device: str, board_size: int, sims: int) -> MCTS:
+        key = (role, device, board_size, sims)
+        cached = self.mcts_cache.get(key)
+        if cached is not None:
+            return cached
+        mcts = MCTS(
+            model=bundle.model,
+            board_size=board_size,
+            num_simulations=sims,
+            device=device,
+        )
+        self.mcts_cache[key] = mcts
+        return mcts
+
+    @staticmethod
+    def _infer_move_job(mcts: MCTS, state: GoState) -> Optional[tuple[int, int]]:
+        _, action = mcts.run(state, temperature=1e-6, add_exploration_noise=False)
+        return decode_action(state.board_size, action)
+
+    def _poll_inference_result(self, token: int):
+        fut = self.pending_infer_future
+        if fut is None:
+            return
+        if not fut.done():
+            QTimer.singleShot(10, lambda: self._poll_inference_result(token))
+            return
+
+        snapshot = self.pending_infer_snapshot
+        self.pending_infer_future = None
+        self.pending_infer_snapshot = None
+        if token != self.pending_infer_token:
+            return
+        if snapshot is None or self.state is None:
+            return
+        current_snapshot = (self.state.move_count, self.state.to_play, self.state.board.tobytes())
+        if current_snapshot != snapshot:
+            self._set_ai_status("")
+            return
+
+        try:
+            move = fut.result()
+        except Exception as e:
+            QMessageBox.critical(self, "AI 推理失败", str(e))
+            self.auto_playing = False
+            self.auto_btn.setText("自动到终局")
+            self._set_ai_status("")
+            return
+
+        self._set_ai_status("")
+        self._apply_move(move)
+
     def ai_step(self):
         if self._game_over():
+            return
+        if self.pending_infer_future is not None:
             return
         role = self._role_for_side(self.state.to_play)
         if role == ROLE_HUMAN:
             return
 
-        self._set_ai_status("AI 推理中...")
+        self._set_ai_status("AI 推理中...", flush=True)
 
         device = self.device.currentText()
         if device == "cuda" and not torch.cuda.is_available():
@@ -649,16 +739,19 @@ class BattleWindow(QMainWindow):
             self._set_ai_status("")
             return
 
-        mcts = MCTS(
-            model=bundle.model,
-            board_size=self.state.board_size,
-            num_simulations=int(self.sims.value()),
+        state_snapshot = (self.state.move_count, self.state.to_play, self.state.board.tobytes())
+        mcts = self._build_mcts(
+            role=role,
+            bundle=bundle,
             device=device,
+            board_size=self.state.board_size,
+            sims=int(self.sims.value()),
         )
-        _, action = mcts.run(self.state, temperature=1e-6, add_exploration_noise=False)
-        move = decode_action(self.state.board_size, action)
-        self._apply_move(move)
-        self._set_ai_status("")
+        self.pending_infer_token += 1
+        token = self.pending_infer_token
+        self.pending_infer_snapshot = state_snapshot
+        self.pending_infer_future = self.infer_executor.submit(self._infer_move_job, mcts, self.state)
+        QTimer.singleShot(10, lambda: self._poll_inference_result(token))
 
     def toggle_auto_play(self):
         self.auto_playing = not self.auto_playing
@@ -678,6 +771,14 @@ class BattleWindow(QMainWindow):
         QTimer.singleShot(10, self.ai_step)
 
     def _update_log_view(self):
+        self._log_dirty = True
+        if not self.log_timer.isActive():
+            self.log_timer.start(80)
+
+    def _flush_log_view(self):
+        if not self._log_dirty:
+            return
+        self._log_dirty = False
         self.log_view.setPlainText("\n".join(self.logs[-200:]))
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -720,6 +821,12 @@ class BattleWindow(QMainWindow):
         self._update_log_view()
         self.undo_btn.setEnabled(len(self.history) > 1)
         self.pass_btn.setEnabled((not self._game_over()) and self._human_turn())
+
+    def closeEvent(self, event):
+        self.auto_playing = False
+        self._cancel_pending_inference()
+        self.infer_executor.shutdown(wait=False, cancel_futures=True)
+        super().closeEvent(event)
 
 
 def main():
