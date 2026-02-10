@@ -167,6 +167,8 @@ class BattleWindow(QMainWindow):
         self.logs: list[str] = []
         self.model_cache: dict[tuple[str, str], ModelBundle] = {}
         self.auto_playing = False
+        self.manual_game_end = False
+        self.game_started = False
 
         self.board = BoardWidget()
         self.board.on_click = self.on_board_click
@@ -184,9 +186,6 @@ class BattleWindow(QMainWindow):
         self.komi.setRange(0.0, 20.0)
         self.komi.setSingleStep(0.5)
         self.komi.setValue(5.5)
-        self.history_len = QSpinBox()
-        self.history_len.setRange(1, 16)
-        self.history_len.setValue(8)
         self.sims = QSpinBox()
         self.sims.setRange(1, 2048)
         self.sims.setValue(192)
@@ -201,7 +200,8 @@ class BattleWindow(QMainWindow):
         self.black_role = QComboBox()
         self.white_role = QComboBox()
         self.refresh_btn = QPushButton("刷新模型列表")
-        self.new_btn = QPushButton("开始新对局")
+        self.new_btn = QPushButton("开始对局")
+        self.end_btn = QPushButton("结束对局")
         self.undo_btn = QPushButton("悔棋")
         self.pass_btn = QPushButton("停一手")
         self.ai_btn = QPushButton("AI 下一手")
@@ -211,7 +211,7 @@ class BattleWindow(QMainWindow):
         self._apply_font_theme()
         self._bind_events()
         self.refresh_checkpoints()
-        self.new_game()
+        self._refresh_view()
 
     def _apply_font_theme(self):
         # Larger default typography for high-DPI and zoomed windows.
@@ -247,7 +247,6 @@ class BattleWindow(QMainWindow):
         cfg_grid = QFormLayout(cfg_box)
         cfg_grid.addRow("棋盘大小", self.board_size)
         cfg_grid.addRow("贴目", self.komi)
-        cfg_grid.addRow("历史平面", self.history_len)
         cfg_grid.addRow("MCTS 模拟", self.sims)
         cfg_grid.addRow("设备", self.device)
         cfg_grid.addRow("自动模式", self.auto_mode)
@@ -258,10 +257,11 @@ class BattleWindow(QMainWindow):
         btn_grid = QGridLayout()
         btn_grid.addWidget(self.refresh_btn, 0, 0)
         btn_grid.addWidget(self.new_btn, 0, 1)
-        btn_grid.addWidget(self.undo_btn, 1, 0)
-        btn_grid.addWidget(self.pass_btn, 1, 1)
-        btn_grid.addWidget(self.ai_btn, 2, 0)
-        btn_grid.addWidget(self.auto_btn, 2, 1)
+        btn_grid.addWidget(self.end_btn, 1, 0)
+        btn_grid.addWidget(self.undo_btn, 1, 1)
+        btn_grid.addWidget(self.pass_btn, 2, 0)
+        btn_grid.addWidget(self.ai_btn, 2, 1)
+        btn_grid.addWidget(self.auto_btn, 3, 0, 1, 2)
         right.addLayout(btn_grid)
 
         right.addWidget(QLabel("着手记录"))
@@ -271,6 +271,7 @@ class BattleWindow(QMainWindow):
     def _bind_events(self):
         self.refresh_btn.clicked.connect(self.refresh_checkpoints)
         self.new_btn.clicked.connect(self.new_game)
+        self.end_btn.clicked.connect(self.end_game)
         self.undo_btn.clicked.connect(self.undo_move)
         self.pass_btn.clicked.connect(self.pass_move)
         self.ai_btn.clicked.connect(self.ai_step)
@@ -278,6 +279,9 @@ class BattleWindow(QMainWindow):
         self.auto_mode.activated.connect(self._on_option_activated)
         self.black_role.activated.connect(self._on_option_activated)
         self.white_role.activated.connect(self._on_option_activated)
+        self.auto_mode.currentIndexChanged.connect(self._on_option_changed)
+        self.black_role.currentIndexChanged.connect(self._on_option_changed)
+        self.white_role.currentIndexChanged.connect(self._on_option_changed)
 
     def refresh_checkpoints(self):
         options = [("真人", ROLE_HUMAN)]
@@ -316,26 +320,74 @@ class BattleWindow(QMainWindow):
         return bool(self.auto_mode.currentData())
 
     def _on_option_activated(self, _index: int):
-        # Let combo popup close first, then run auto logic.
-        QTimer.singleShot(220, self._maybe_auto_step)
+        combo = self.sender()
+        if isinstance(combo, QComboBox):
+            QTimer.singleShot(0, combo.hidePopup)
+            QTimer.singleShot(0, combo.clearFocus)
+        QTimer.singleShot(120, self._maybe_auto_step)
+
+    def _on_option_changed(self, _index: int):
+        QTimer.singleShot(120, self._maybe_auto_step)
+
+    def _infer_history_len(self) -> int:
+        for combo in (self.black_role, self.white_role):
+            role = self._role_value(combo)
+            if role == ROLE_HUMAN:
+                continue
+            cached = self.model_cache.get((role, self.device.currentText()))
+            if cached is not None:
+                return int(cached.cfg.get("history_len", 8))
+            try:
+                ckpt = torch.load(role, map_location="cpu")
+                cfg = ckpt.get("cfg", {})
+                return int(cfg.get("history_len", 8))
+            except Exception:
+                return 8
+        return 8
 
     def new_game(self):
         self.auto_playing = False
+        self.manual_game_end = False
+        self.game_started = True
         self.auto_btn.setText("自动到终局")
         self.state = GoState.new_game(
             board_size=int(self.board_size.value()),
             komi=float(self.komi.value()),
-            history_len=int(self.history_len.value()),
+            history_len=self._infer_history_len(),
         )
         self.history = [self.state]
         self.logs = []
         self._refresh_view()
         self._maybe_auto_step()
 
-    def undo_move(self):
-        if len(self.history) <= 1:
+    def end_game(self):
+        if not self.game_started or self.state is None:
             return
         self.auto_playing = False
+        self.auto_btn.setText("自动到终局")
+        if not self.manual_game_end and not self.state.is_terminal():
+            b, w = self.state.score()
+            winner = self.state.winner()
+            if winner == BLACK:
+                result = "黑方胜"
+            elif winner == WHITE:
+                result = "白方胜"
+            else:
+                result = "和棋"
+            self.logs.append(f"[系统] 对局已手动结束，结算：{result}（黑 {b:.1f} / 白 {w:.1f}）")
+        self.manual_game_end = True
+        self._refresh_view()
+
+    def _game_over(self) -> bool:
+        if (not self.game_started) or self.state is None:
+            return True
+        return self.manual_game_end or self.state.is_terminal()
+
+    def undo_move(self):
+        if (not self.game_started) or len(self.history) <= 1:
+            return
+        self.auto_playing = False
+        self.manual_game_end = False
         self.auto_btn.setText("自动到终局")
         self.history.pop()
         if self.logs:
@@ -344,14 +396,14 @@ class BattleWindow(QMainWindow):
         self._refresh_view()
 
     def pass_move(self):
-        if self.state is None or self.state.is_terminal():
+        if self._game_over():
             return
         if not self._human_turn():
             return
         self._apply_move(None)
 
     def on_board_click(self, r: int, c: int):
-        if self.state is None or self.state.is_terminal():
+        if self._game_over():
             return
         if not self._human_turn():
             return
@@ -396,7 +448,7 @@ class BattleWindow(QMainWindow):
         cfg = ckpt.get("cfg", {})
         model = AlphaZeroNet(
             board_size=int(cfg.get("board_size", self.board_size.value())),
-            history_len=int(cfg.get("history_len", self.history_len.value())),
+            history_len=int(cfg.get("history_len", self._infer_history_len())),
             channels=int(cfg.get("channels", 192)),
             num_blocks=int(cfg.get("num_blocks", 12)),
             use_se=bool(cfg.get("use_se", True)),
@@ -410,7 +462,7 @@ class BattleWindow(QMainWindow):
         return bundle
 
     def ai_step(self):
-        if self.state is None or self.state.is_terminal():
+        if self._game_over():
             return
         role = self._role_for_side(self.state.to_play)
         if role == ROLE_HUMAN:
@@ -465,7 +517,7 @@ class BattleWindow(QMainWindow):
         auto_triggered = self.auto_playing or self._auto_mode_enabled()
         if not auto_triggered:
             return
-        if self.state is None or self.state.is_terminal():
+        if self._game_over():
             self.auto_playing = False
             self.auto_btn.setText("自动到终局")
             return
@@ -474,6 +526,14 @@ class BattleWindow(QMainWindow):
         QTimer.singleShot(10, self.ai_step)
 
     def _refresh_view(self):
+        if (not self.game_started) or self.state is None:
+            self.turn_label.setText("当前行棋: 未开始")
+            self.score_label.setText("比分: -")
+            self.terminal_label.setText("请点击“开始对局”")
+            self.log_view.setPlainText("\n".join(self.logs[-200:]))
+            self.undo_btn.setEnabled(False)
+            self.pass_btn.setEnabled(False)
+            return
         if self.state is None:
             return
         self.board.set_state(self.state)
@@ -481,7 +541,16 @@ class BattleWindow(QMainWindow):
         self.turn_label.setText(f"当前行棋: {side}")
         b, w = self.state.score()
         self.score_label.setText(f"比分: 黑方 {b:.1f} | 白方 {w:.1f}")
-        if self.state.is_terminal():
+        if self.manual_game_end:
+            winner = self.state.winner()
+            if winner == BLACK:
+                result = "黑方胜"
+            elif winner == WHITE:
+                result = "白方胜"
+            else:
+                result = "和棋"
+            self.terminal_label.setText(f"终局: 手动结束（{result}）")
+        elif self.state.is_terminal():
             winner = self.state.winner()
             if winner == BLACK:
                 self.terminal_label.setText("终局: 黑方胜")
@@ -493,7 +562,7 @@ class BattleWindow(QMainWindow):
             self.terminal_label.setText("")
         self.log_view.setPlainText("\n".join(self.logs[-200:]))
         self.undo_btn.setEnabled(len(self.history) > 1)
-        self.pass_btn.setEnabled((not self.state.is_terminal()) and self._human_turn())
+        self.pass_btn.setEnabled((not self._game_over()) and self._human_turn())
 
 
 def main():
