@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ try:
         QComboBox,
         QDoubleSpinBox,
         QFormLayout,
+        QFileDialog,
         QGridLayout,
         QGroupBox,
         QHBoxLayout,
@@ -207,6 +209,8 @@ class BattleWindow(QMainWindow):
         self.pass_btn = QPushButton("停一手")
         self.ai_btn = QPushButton("AI 下一手")
         self.auto_btn = QPushButton("自动到终局")
+        self.export_sgf_btn = QPushButton("导出 SGF")
+        self.import_sgf_btn = QPushButton("导入 SGF")
 
         self._build_ui()
         self._apply_font_theme()
@@ -263,6 +267,8 @@ class BattleWindow(QMainWindow):
         btn_grid.addWidget(self.pass_btn, 2, 0)
         btn_grid.addWidget(self.ai_btn, 2, 1)
         btn_grid.addWidget(self.auto_btn, 3, 0, 1, 2)
+        btn_grid.addWidget(self.export_sgf_btn, 4, 0)
+        btn_grid.addWidget(self.import_sgf_btn, 4, 1)
         right.addLayout(btn_grid)
 
         right.addWidget(QLabel("着手记录"))
@@ -277,6 +283,8 @@ class BattleWindow(QMainWindow):
         self.pass_btn.clicked.connect(self.pass_move)
         self.ai_btn.clicked.connect(self.ai_step)
         self.auto_btn.clicked.connect(self.toggle_auto_play)
+        self.export_sgf_btn.clicked.connect(self.export_sgf)
+        self.import_sgf_btn.clicked.connect(self.import_sgf)
         self.auto_mode.activated.connect(self._on_option_activated)
         self.black_role.activated.connect(self._on_option_activated)
         self.white_role.activated.connect(self._on_option_activated)
@@ -361,6 +369,139 @@ class BattleWindow(QMainWindow):
         self._refresh_view()
         self._maybe_auto_step()
 
+    def _moves_from_history(self) -> list[Optional[tuple[int, int]]]:
+        if len(self.history) <= 1:
+            return []
+        return [st.last_move for st in self.history[1:]]
+
+    @staticmethod
+    def _move_to_sgf_coord(move: Optional[tuple[int, int]]) -> str:
+        if move is None:
+            return ""
+        r, c = move
+        return f"{chr(ord('a') + c)}{chr(ord('a') + r)}"
+
+    @staticmethod
+    def _sgf_coord_to_move(coord: str, board_size: int) -> Optional[tuple[int, int]]:
+        if coord == "":
+            return None
+        if len(coord) != 2:
+            raise ValueError(f"非法 SGF 坐标: {coord}")
+        c = ord(coord[0]) - ord("a")
+        r = ord(coord[1]) - ord("a")
+        if not (0 <= r < board_size and 0 <= c < board_size):
+            raise ValueError(f"SGF 坐标越界: {coord}")
+        return (r, c)
+
+    @staticmethod
+    def _extract_sgf_prop(sgf_text: str, key: str) -> str:
+        m = re.search(rf"{re.escape(key)}\[(.*?)\]", sgf_text, flags=re.IGNORECASE | re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    def export_sgf(self):
+        if (not self.game_started) or self.state is None:
+            QMessageBox.information(self, "提示", "当前没有可导出的对局。")
+            return
+        default_name = f"go_{self.state.board_size}x{self.state.board_size}.sgf"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出 SGF",
+            default_name,
+            "SGF Files (*.sgf);;All Files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".sgf"):
+            path = f"{path}.sgf"
+
+        moves = self._moves_from_history()
+        sgf_parts = [
+            "(",
+            f";FF[4]GM[1]SZ[{int(self.state.board_size)}]KM[{float(self.state.komi):g}]CA[UTF-8]",
+        ]
+        color = "B"
+        for mv in moves:
+            sgf_parts.append(f";{color}[{self._move_to_sgf_coord(mv)}]")
+            color = "W" if color == "B" else "B"
+        sgf_parts.append(")")
+        sgf_text = "".join(sgf_parts)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(sgf_text)
+            QMessageBox.information(self, "导出成功", f"SGF 已保存到:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+
+    def import_sgf(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入 SGF",
+            "",
+            "SGF Files (*.sgf);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                sgf_text = f.read()
+
+            if "GM[1]" not in sgf_text and "gm[1]" not in sgf_text.lower():
+                raise ValueError("仅支持围棋 SGF（GM[1]）。")
+
+            size_raw = self._extract_sgf_prop(sgf_text, "SZ")
+            if not size_raw:
+                board_size = 19
+            elif ":" in size_raw:
+                left, right = size_raw.split(":", 1)
+                if left != right:
+                    raise ValueError("仅支持方形棋盘 SGF（如 SZ[9]）。")
+                board_size = int(left)
+            else:
+                board_size = int(size_raw)
+            if not (5 <= board_size <= 19):
+                raise ValueError(f"棋盘大小超出界面支持范围: {board_size}")
+
+            komi_raw = self._extract_sgf_prop(sgf_text, "KM")
+            komi = float(komi_raw) if komi_raw else 5.5
+            history_len = self._infer_history_len()
+
+            move_tokens = re.findall(r";\s*([BW])\s*\[([^\]]*)\]", sgf_text, flags=re.IGNORECASE)
+            moves: list[tuple[str, Optional[tuple[int, int]]]] = []
+            for color_str, coord in move_tokens:
+                color = color_str.upper()
+                if color not in {"B", "W"}:
+                    continue
+                coord_clean = coord.strip().lower()
+                moves.append((color, self._sgf_coord_to_move(coord_clean, board_size)))
+
+            self.auto_playing = False
+            self.auto_btn.setText("自动到终局")
+            self.manual_game_end = False
+            self.game_started = True
+            self.board_size.setValue(board_size)
+            self.komi.setValue(komi)
+            self.state = GoState.new_game(board_size=board_size, komi=komi, history_len=history_len)
+            self.history = [self.state]
+            self.logs = [f"[系统] 已导入 SGF: {Path(path).name}"]
+
+            for idx, (color, mv) in enumerate(moves, start=1):
+                if self.state is None:
+                    raise RuntimeError("内部状态异常：state 为空。")
+                if self.state.is_terminal():
+                    raise ValueError(f"第 {idx} 手后棋局已终局，后续着手无效。")
+                expected = "B" if self.state.to_play == BLACK else "W"
+                if color != expected:
+                    raise ValueError(f"第 {idx} 手颜色不匹配: SGF={color}, 轮到={expected}")
+                if not self.state.is_legal(mv):
+                    raise ValueError(f"第 {idx} 手不合法: {mv}")
+                self._apply_move(mv, trigger_auto=False)
+
+            self._refresh_view()
+            QMessageBox.information(self, "导入完成", f"已复现 {len(moves)} 手。")
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败", str(e))
+
     def end_game(self):
         if not self.game_started or self.state is None:
             return
@@ -421,7 +562,7 @@ class BattleWindow(QMainWindow):
             return self._role_value(self.black_role)
         return self._role_value(self.white_role)
 
-    def _apply_move(self, move: Optional[tuple[int, int]]):
+    def _apply_move(self, move: Optional[tuple[int, int]], trigger_auto: bool = True):
         if self.state is None:
             return
         if not self.state.is_legal(move):
@@ -442,7 +583,8 @@ class BattleWindow(QMainWindow):
             self.logs.append(f"{by}: {label}")
         self.history.append(self.state)
         self._refresh_view()
-        self._maybe_auto_step()
+        if trigger_auto:
+            self._maybe_auto_step()
 
     def _set_ai_status(self, text: str):
         self.ai_status_label.setText(text)
